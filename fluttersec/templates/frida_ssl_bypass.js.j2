@@ -1,0 +1,171 @@
+/**
+ * FlutterSec-Automator — Generated Frida SSL Bypass Script
+ * =========================================================
+ * Package      : {{ package_name }} ({{ version_name }})
+ * Flutter      : {{ flutter_version }}
+ * Engine Hash  : {{ engine_hash }}
+ * Build ID     : {{ build_id }}
+ * Frida Mode   : {{ mode }}
+ * Generated At : {{ generated_at }}
+ *
+ * Inject (frida-server / USB):
+ *   frida -U -f {{ package_name }} -l <this_script>.js --no-pause
+ *
+ * Inject (Frida Gadget embedded):
+ *   Copy this script alongside the gadget config and connect via:
+ *   frida-gadget  (or frida -H 127.0.0.1:27042 ...)
+ *
+ * ⚠  For authorized security research and educational purposes only.
+ */
+
+"use strict";
+
+// ── Configuration ─────────────────────────────────────────────────────────────
+const CONFIG = {
+  packageName: "{{ package_name }}",
+  flutterVersion: "{{ flutter_version }}",
+  mode: "{{ mode }}",
+  verbose: true,
+};
+
+// ── Logging helpers ───────────────────────────────────────────────────────────
+function log(msg) {
+  if (CONFIG.verbose) {
+    console.log("[FlutterSec] " + msg);
+  }
+}
+
+function logSuccess(msg) {
+  console.log("\x1b[32m[FlutterSec ✔]\x1b[0m " + msg);
+}
+
+function logWarn(msg) {
+  console.warn("\x1b[33m[FlutterSec ⚠]\x1b[0m " + msg);
+}
+
+// ── Bootstrap: wait for libflutter.so or inject immediately ──────────────────
+{% if mode == "gadget" or mode == "both" %}
+// Gadget mode — library is already mapped at script injection time.
+log("Gadget mode: injecting immediately.");
+hookFlutterSSL();
+{% else %}
+// Server mode — poll until libflutter.so is loaded.
+log("Server mode: waiting for libflutter.so…");
+const _waitInterval = setInterval(function () {
+  const lib = Process.findModuleByName("libflutter.so");
+  if (lib !== null) {
+    clearInterval(_waitInterval);
+    log("libflutter.so found at base: " + lib.base);
+    hookFlutterSSL();
+  }
+}, 300);
+{% endif %}
+
+// ── Main hook installer ───────────────────────────────────────────────────────
+function hookFlutterSSL() {
+  const libFlutter = Process.findModuleByName("libflutter.so");
+  if (!libFlutter) {
+    logWarn("libflutter.so not found in process modules! Aborting hook.");
+    return;
+  }
+
+  const base = libFlutter.base;
+  log("libflutter.so base: " + base);
+  log("Flutter Engine version: {{ flutter_version }}");
+
+{% if offsets %}
+  // ── Hooking {{ offsets | length }} auto-detected SSL offset(s) ────────────
+{% for offset in offsets %}
+  // ── [{{ loop.index }}/{{ offsets | length }}] {{ offset.symbol }} ─────────
+  //    Method : {{ offset.method }}
+  //    Arch   : {{ offset.arch }}
+  //    VA     : 0x{{ '%08x' | format(offset.virtual_address) }}
+  //    File + : 0x{{ '%08x' | format(offset.file_offset) }}
+  (function () {
+    var targetAddr = base.add(0x{{ '%x' | format(offset.file_offset) }});
+    try {
+      // Wrap the target address as a NativeFunction so Frida knows its ABI.
+      // ssl_verify_result_t ssl_verify_peer_cert(SSL *ssl, uint8_t *out_alert)
+      var sslVerifyPeerCert = new NativeFunction(
+        targetAddr,
+        'int',            // return type  — ssl_verify_result_t (0 = ok, 1 = invalid)
+        ['pointer', 'pointer']  // (ssl, out_alert)
+      );
+
+      // Interceptor.replace completely substitutes the function body.
+      // This runs INSTEAD of the original — BoringSSL never sees a failure,
+      // so no handshake error is registered and the Dart engine stays stable.
+      Interceptor.replace(targetAddr, new NativeCallback(
+        function (ssl, out_alert) {
+          logSuccess(
+            "[{{ loop.index }}/{{ offsets | length }}] {{ offset.symbol }} intercepted "
+            + "— forcing retval=0x0 (ssl_verify_ok)"
+          );
+          return 0; // ssl_verify_ok — bypass complete
+        },
+        'int',            // return type matches NativeFunction above
+        ['pointer', 'pointer']  // (ssl, out_alert)
+      ));
+
+      logSuccess("Replaced [{{ loop.index }}]: {{ offset.symbol }} @ " + targetAddr);
+    } catch (e) {
+      logWarn("Failed to replace {{ offset.symbol }}: " + e.message);
+    }
+  })();
+
+{% endfor %}
+{% else %}
+  // ── No SSL offsets were auto-detected ────────────────────────────────────
+  //
+  // The analyzer did not find any SSL pinning offsets in this binary.
+  // Possible reasons:
+  //   1. The Flutter Engine version ({{ flutter_version }}) has no patterns in
+  //      data/patterns.yaml yet. Add one and re-run the tool.
+  //   2. The binary is heavily obfuscated or packed.
+  //   3. SSL pinning is implemented in Dart (not native BoringSSL).
+  //
+  // Manual analysis steps:
+  //   - Open libflutter.so in Ghidra or IDA Pro.
+  //   - Search for "ssl_verify_peer_cert" or "SSL_CTX_set_custom_verify".
+  //   - Find the function prologue offset relative to the library base.
+  //   - Replace 0xDEADBEEF below with the actual file offset:
+  //
+  //   Interceptor.replace(base.add(0xDEADBEEF), new NativeCallback(
+  //     function (ssl, out_alert) {
+  //       console.log("[FlutterSec ✔] ssl_verify_peer_cert intercepted - forcing retval=0x0");
+  //       return 0; // ssl_verify_ok
+  //     },
+  //     'int', ['pointer', 'pointer']
+  //   ));
+  logWarn("No SSL offsets auto-detected for Flutter {{ flutter_version }}.");
+  logWarn("Manual analysis required — see inline comments.");
+{% endif %}
+
+  // ── Java-layer SSL bypass (Android 7+ Network Security Config) ────────────
+  // Neutralizes OkHttp / platform certificate verifier if present alongside
+  // the native BoringSSL bypass above.
+  Java.perform(function () {
+    try {
+      var X509TrustManager = Java.use("javax.net.ssl.X509TrustManager");
+      var SSLContext        = Java.use("javax.net.ssl.SSLContext");
+
+      var TrustManager = Java.registerClass({
+        name: "com.fluttersec.bypass.UniversalTrustManager",
+        implements: [X509TrustManager],
+        methods: {
+          checkClientTrusted: function (_chain, _authType) {},
+          checkServerTrusted: function (_chain, _authType) {},
+          getAcceptedIssuers: function () { return []; },
+        },
+      });
+
+      var ctx = SSLContext.getInstance("TLS");
+      ctx.init(null, [TrustManager.$new()], null);
+      SSLContext.setDefault(ctx);
+      logSuccess("Java SSLContext TrustManager bypassed.");
+    } catch (e) {
+      log("Java SSL bypass skipped: " + e.message);
+    }
+  });
+}
+

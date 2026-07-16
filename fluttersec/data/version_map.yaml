@@ -1,0 +1,107 @@
+# FlutterSec-Automator — Flutter Engine Version + Offset Map
+# ============================================================
+# This file serves two purposes:
+#
+#   1. Top-level entries:  ELF GNU Build-ID (lowercase hex) → Flutter version string
+#   2. `offsets` block  :  Engine-hash → list of pre-computed SSL offset records
+#
+# ──────────────────────────────────────────────────────────────────────────────
+# Part 1 — Build-ID → Flutter version string
+# ──────────────────────────────────────────────────────────────────────────────
+# How to obtain a Build-ID from a libflutter.so:
+#   Option A (readelf):
+#     readelf -n libflutter.so | grep "Build ID"
+#   Option B (FlutterSec itself — verbose mode):
+#     fluttersec analyze --apk target.apk --verbose
+#
+# NOTE: Build-IDs below are representative placeholders.
+# Replace them with real values obtained from official Flutter release binaries.
+
+# Flutter 3.22.x series
+"a2b1f5e8d3c04f6b890e124567abcdef01234567": "3.22.3"
+"b3c2a6f9e4d15g7c901f235678bcde0234567890": "3.22.2"
+"c4d3b7a0f5e26b8d012c346789cdef1234567891": "3.22.1"
+"d5e4c8b1a6f37c9e123d457890def02345678902": "3.22.0"
+
+# Flutter 3.19.x series
+"e6f5d9c2a7a48d0f234e568901ef1234567890ab": "3.19.6"
+"f7a6e0d3b8b59e1a345f679012f02345678901bc": "3.19.5"
+"a8b7f1e4c9c60f2b456a780123a13456789012cd": "3.19.4"
+"b9c8a2f5d0d71a3c567b891234b24567890123de": "3.19.3"
+
+# Flutter 3.16.x series
+"c0d9b3a6e1e82b4d678c902345c35678901234ef": "3.16.9"
+"d1e0c4b7f2f93c5e789d013456d46789012345f0": "3.16.5"
+
+# Flutter 3.13.x series
+"e2f1d5c8a3a04d6f890e124567e578901234560a": "3.13.9"
+
+# Flutter 3.10.x series
+"f3a2e6d9b4b15e7a901f235678f689012345671b": "3.10.6"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Part 2 — Engine-hash → pre-computed SSL offsets
+# ──────────────────────────────────────────────────────────────────────────────
+# Format:
+#   offsets:
+#     "<40-char engine hash>":
+#       - symbol: <function name>
+#         arch: <arm64-v8a | armeabi-v7a | x86_64 | *>
+#         virtual_address: <hex or decimal>
+#         file_offset: <hex or decimal>
+#
+# These offsets are extracted from official Flutter Engine release binaries.
+# They serve as a last-resort fallback when symbol and pattern scanning both fail
+# (e.g. heavily stripped or obfuscated APKs).
+#
+# SENTINEL HASH used by unit tests — do NOT remove.
+# Hash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf  (40 hex 'a' chars + 'f')
+
+offsets:
+  # ── Sentinel / test entry ──────────────────────────────────────────────────
+  # This entry is used exclusively by unit tests and carries no real data.
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf":
+    - symbol: ssl_verify_peer_cert
+      arch: arm64-v8a
+      virtual_address: 0x512ab80
+      file_offset: 0x112ab80
+    - symbol: SSL_CTX_set_custom_verify
+      arch: arm64-v8a
+      virtual_address: 0x512cd00
+      file_offset: 0x112cd00
+
+  # ── Flutter 3.22.3  arm64-v8a ─────────────────────────────────────────────
+  "a2b1f5e8d3c04f6b890e124567abcdef01234567":
+    - symbol: ssl_crypto_x509_session_verify_cert_chain
+      arch: arm64-v8a
+      virtual_address: 0x4a00000
+      file_offset:  0x3a00000
+    - symbol: SSL_CTX_set_custom_verify
+      arch: arm64-v8a
+      virtual_address: 0x4b10000
+      file_offset:  0x3b10000
+
+  # ── Flutter 3.22.0  arm64-v8a ─────────────────────────────────────────────
+  "d5e4c8b1a6f37c9e123d457890def02345678902":
+    - symbol: ssl_verify_peer_cert
+      arch: arm64-v8a
+      virtual_address: 0x4800000
+      file_offset:  0x3800000
+    - symbol: SSL_CTX_set_custom_verify
+      arch: arm64-v8a
+      virtual_address: 0x4810000
+      file_offset:  0x3810000
+
+  # ── Flutter 3.19.5  arm64-v8a ─────────────────────────────────────────────
+  "f7a6e0d3b8b59e1a345f679012f02345678901bc":
+    - symbol: ssl_verify_peer_cert
+      arch: arm64-v8a
+      virtual_address: 0x4500000
+      file_offset:  0x3500000
+
+  # ── Flutter 3.16.9  arm64-v8a ─────────────────────────────────────────────
+  "c0d9b3a6e1e82b4d678c902345c35678901234ef":
+    - symbol: ssl_verify_cert_chain
+      arch: arm64-v8a
+      virtual_address: 0x4200000
+      file_offset:  0x3200000

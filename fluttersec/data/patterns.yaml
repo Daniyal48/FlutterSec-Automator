@@ -1,0 +1,91 @@
+# FlutterSec-Automator SSL Pinning Pattern Database
+# ====================================================
+# Format per entry:
+#   symbol:  Descriptive name of the target function
+#   arch:    ABI architecture  (*=all, arm64-v8a, armeabi-v7a, x86_64)
+#   version: Flutter Engine version prefix  (*=all versions, "3."=3.x, "3.22."=3.22.x)
+#   pattern: Space-separated hex bytes;  "??" = wildcard (matches any single byte)
+#
+# Sources / Credits:
+#   - https://github.com/WithSecureLabs/flutter-ssl-pinning-bypass
+#   - https://blog.nviso.eu/2019/08/13/intercepting-traffic-from-android-flutter-applications/
+#   - https://media.defcon.org/DEF%20CON%2030/DEF%20CON%2030%20presentations/
+#   - Manual reverse engineering of Flutter Engine releases 3.x / 3.22+
+#
+# IMPORTANT: Patterns are architecture- and version-sensitive.
+# Always validate against a known sample before committing a new entry.
+# Use "??" liberally where instruction operands vary across builds.
+
+patterns:
+
+  # ── arm64-v8a (AArch64) patterns ──────────────────────────────────────────
+
+  # ssl_crypto_x509_session_verify_cert_chain  (Flutter ≥ 3.3, arm64)
+  # Function prologue: stp x29, x30, [sp, #-N]!  ;  mov x29, sp
+  - symbol: ssl_crypto_x509_session_verify_cert_chain
+    arch: arm64-v8a
+    version: "3."
+    pattern: "FD 7B ?? A9 FD 03 00 91 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??"
+
+  # ssl_verify_peer_cert  (Flutter 3.x, arm64 — BoringSSL certificate verifier)
+  # Typical stack frame open: sub sp, sp, #N ; stp x29, x30, [sp, #M]
+  - symbol: ssl_verify_peer_cert
+    arch: arm64-v8a
+    version: "3."
+    pattern: "FF 83 ?? D1 FD 7B ?? A9 ?? ?? ?? ??"
+
+  # SSL_CTX_set_custom_verify  (arm64, all Flutter versions)
+  # Short stub: loads ctx, offsets verify callback pointer, returns
+  - symbol: SSL_CTX_set_custom_verify
+    arch: arm64-v8a
+    version: "*"
+    pattern: "08 00 40 F9 ?? 00 00 91 08 ?? 00 F9 C0 03 5F D6"
+
+  # ssl_verify_cert_chain  (Flutter 3.19+, arm64)
+  - symbol: ssl_verify_cert_chain
+    arch: arm64-v8a
+    version: "3.19."
+    pattern: "FD 7B ?? A9 FD 03 00 91 ?? ?? ?? ?? 08 00 40 F9 ?? ?? ?? ??"
+
+  # ssl_verify_cert_chain  (Flutter 3.22+, arm64)
+  - symbol: ssl_verify_cert_chain
+    arch: arm64-v8a
+    version: "3.22."
+    pattern: "FD 7B ?? A9 FD 03 00 91 ?? ?? ?? ?? ?? ?? ?? ?? 08 00 40 F9"
+
+  # ── armeabi-v7a (ARM32 / Thumb-2) patterns ────────────────────────────────
+
+  # ssl_crypto_x509_session_verify_cert_chain  (Flutter 3.x, arm32)
+  # PUSH {r4-r11, lr}  variant seen in Thumb-2 prologues
+  - symbol: ssl_crypto_x509_session_verify_cert_chain
+    arch: armeabi-v7a
+    version: "3."
+    pattern: "2D E9 ?? ?? ?? ?? 00 AF ?? ?? ?? ?? ?? ?? ?? ??"
+
+  # SSL_CTX_set_custom_verify  (arm32, all versions)
+  # LDR r0, [r0, #N]  ;  ADD r0, r0, #M  ;  STR r0, [r0, #N]  ;  BX lr
+  - symbol: SSL_CTX_set_custom_verify
+    arch: armeabi-v7a
+    version: "*"
+    pattern: "10 60 90 E5 ?? ?? 80 E2 10 00 80 E5 1E FF 2F E1"
+
+  # ssl_verify_peer_cert  (arm32, Flutter 3.x)
+  - symbol: ssl_verify_peer_cert
+    arch: armeabi-v7a
+    version: "3."
+    pattern: "F0 B5 ?? ?? ?? ?? ?? ?? 0D 46 ?? ?? ?? ??"
+
+  # ── x86_64 (emulator / desktop) patterns ──────────────────────────────────
+
+  # ssl_verify_peer_cert  (x86_64)
+  # Classic System V AMD64 prologue: push rbp ; mov rbp, rsp
+  - symbol: ssl_verify_peer_cert
+    arch: x86_64
+    version: "*"
+    pattern: "55 48 89 E5 ?? ?? ?? ?? ?? ?? 5D C3"
+
+  # SSL_CTX_set_custom_verify  (x86_64, all versions)
+  - symbol: SSL_CTX_set_custom_verify
+    arch: x86_64
+    version: "*"
+    pattern: "55 48 89 E5 48 8B ?? ?? 48 89 ?? ?? 5D C3"
