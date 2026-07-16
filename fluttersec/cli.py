@@ -104,6 +104,11 @@ def analyze(
         "-v",
         help="Enable debug-level logging output.",
     ),
+    offset: str | None = typer.Option(
+        None,
+        "--offset",
+        help="Manual SSL offset provided by user",
+    )
 ) -> None:
     """Analyze a Flutter APK/IPA and generate a Frida SSL bypass script.
 
@@ -168,27 +173,32 @@ def analyze(
             console.print("[yellow]⚠[/]  Flutter Engine version could not be determined.")
 
         # ── Step 3: Locate SSL pinning offsets ────────────────────────────
-        with console.status("[cyan]Scanning for SSL pinning offsets…[/]", spinner="dots"):
-            analyzer = BinaryAnalyzer()
-            offsets = analyzer.find_ssl_offsets(lib_path, engine_version)
+        if offset:
+            from fluttersec.core.binary_analyzer import SslOffset
+            
+            try:
+                # Convert the input string (supports raw strings or 0x prefixes) into an integer
+                parsed_offset = int(offset, 16)
+            except ValueError:
+                console.print(f"[bold red]Error:[/] Invalid hex format provided for offset: '{offset}'")
+                raise typer.Exit(code=1)
 
-        if offsets:
-            console.print(
-                f"[green]✔[/] Found [bold]{len(offsets)}[/] SSL pinning offset(s):"
-            )
-            for off in offsets:
-                console.print(
-                    f"    [dim]→[/] [cyan]{off.symbol}[/]  "
-                    f"VA=0x{off.virtual_address:08x}  "
-                    f"file+0x{off.file_offset:08x}  "
-                    f"[[dim]{off.method}[/]]"
+            # Create a manual entry mapping directly into the existing array format
+            offsets = [
+                SslOffset(
+                    symbol="manual_override_hook",
+                    virtual_address=parsed_offset,
+                    file_offset=parsed_offset,
+                    method="manual",
+                    arch=apk_info.abis[0] if apk_info.abis else "arm64-v8a"
                 )
+            ]
+            console.print(f"[green]✔[/] Manual offset override applied: [bold]{offset}[/]")
         else:
-            console.print(
-                "[yellow]⚠[/]  No SSL offsets found. "
-                "The script will include manual-patch placeholders."
-            )
-
+            with console.status("[cyan]Scanning for SSL pinning offsets…[/]", spinner="dots"):
+                analyzer = BinaryAnalyzer()
+                offsets = analyzer.find_ssl_offsets(lib_path, engine_version)
+                
         # ── Step 4: Generate Frida script ─────────────────────────────────
         with console.status("[cyan]Generating Frida script…[/]", spinner="dots"):
             generator = ScriptGenerator()
