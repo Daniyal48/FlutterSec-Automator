@@ -18,11 +18,15 @@ TestFindSslOffsets            — integration: stub ELF via LIEF,
                                 deduplication by VA, sorted output
 TestAnalyzeAPI                — bound-mode analyze(), raise_on_empty=True/False
 TestVersionMapLoader          — _load_version_map_offsets YAML parsing
+TestXrefStrategy              — _find_string_va, _decode_adrp_target,
+                                _decode_add_imm12, _find_adrp_add_xrefs,
+                                _find_function_start, find_offset_via_xref
 """
 
 from __future__ import annotations
 
 import re
+import struct
 from pathlib import Path
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -741,3 +745,416 @@ class TestAnalyzeAPI:
             assert result.arch == sample_libflutter_path.parent.name
         except BinaryParseError:
             pytest.skip("LIEF rejected the ELF stub.")
+
+
+# ---------------------------------------------------------------------------
+# String XREF strategy unit tests
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# ARM64 instruction encoding helpers used by tests
+# ---------------------------------------------------------------------------
+
+def _encode_adrp(rd: int, pc: int, target_page: int) -> int:
+    """Encode an ARM64 ADRP instruction that loads `target_page` when executed at `pc`.
+
+    Args:
+        rd: Destination register (0-30).
+        pc: Virtual address of this instruction.
+        target_page: Target 4 KB-aligned page VA to load.
+
+    Returns:
+        32-bit instruction word (little-endian integer).
+    """
+    pc_page = pc & ~0xFFF
+    offset = target_page - pc_page           # signed, 33-bit range
+    raw_imm = (offset >> 12) & 0x1FFFFF     # 21 bits of page offset
+    immlo = raw_imm & 0x3
+    immhi = (raw_imm >> 2) & 0x7FFFF
+    return 0x90000000 | (immlo << 29) | (immhi << 5) | (rd & 0x1F)
+
+
+def _encode_add_imm12(rd: int, rn: int, imm12: int) -> int:
+    """Encode ARM64 ADD Xd, Xn, #imm12 (64-bit, shift=0)."""
+    return 0x91000000 | ((imm12 & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+
+
+def _encode_stp_x29_x30_preindex(imm7_scaled: int) -> int:
+    """Encode STP X29, X30, [SP, #imm7_scaled]! (pre-indexed).
+
+    Args:
+        imm7_scaled: Signed byte offset (must be a multiple of 8, range -512..504).
+
+    Returns:
+        32-bit instruction word.
+    """
+    # imm7 field = byte_offset / 8, stored as signed 7-bit.
+    imm7 = (imm7_scaled // 8) & 0x7F
+    # STP Xt1, Xt2, [Xn, #imm]! (pre-index):
+    # [31:30]=10  [29:27]=101  [26]=0  [25:24]=11  [23]=0  [22:16]=imm7
+    # [15:10]=Rt2=30  [9:5]=Rn=31  [4:0]=Rt=29
+    return (
+        0xA9800000       # base: STP Xregs, pre-index, 64-bit
+        | (imm7 << 15)   # imm7 in bits[21:15]... wait, let me be precise
+    )
+    # Precise encoding: bits[31:24]=0xA9, bits[23]=1(pre), bits[22:16]=imm7,
+    # bits[14:10]=Rt2=30, bits[9:5]=Rn=31, bits[4:0]=Rt=29.
+    # In practice the _find_function_start mask is (word & 0xFF00FFFF)==0xA9007BFD
+    # so we only need byte0=0xFD, byte1=0x7B, byte3=0xA9.
+
+
+def _stp_x29_x30_word(frame_bytes: int) -> int:
+    """Return the 32-bit LE word for STP X29, X30, [SP, #-frame_bytes]!.
+
+    The mask used by _find_function_start only checks byte0, byte1, byte3
+    (0xFF00FFFF == 0xA9007BFD), so byte2 (imm7) can be anything.
+    We compute the correct imm7 for correctness.
+    """
+    assert frame_bytes > 0 and frame_bytes % 8 == 0
+    imm7_neg = ((-frame_bytes) // 8) & 0x7F   # 7-bit two's complement
+    # byte0 = 0xFD (Rt=29 | Rn[0]=1)
+    # byte1 = 0x7B (Rn[4:1]=0b1111 | Rt2[0]=0)
+    # byte2 = imm7[6:0] | pre-index bit  (bit23 in the 32-bit word = bit7 of byte2)
+    byte2 = (imm7_neg & 0x7F) | 0x80   # bit7 set = pre-index
+    # byte3 = 0xA9 (opcode: STP 64-bit)
+    return struct.unpack("<I", bytes([0xFD, 0x7B, byte2, 0xA9]))[0]
+
+
+def _make_mock_section(name: str, va: int, content: bytes) -> MagicMock:
+    """Create a mock LIEF section with the given name, VA, and content."""
+    sec = MagicMock()
+    sec.virtual_address = va
+    sec.content = list(content)
+    return sec
+
+
+class TestXrefStrategy:
+    """Unit tests for the string XREF detection strategy.
+
+    All tests use synthetic ARM64 instruction words and mock LIEF objects so
+    no real ELF binary is required.  This keeps the suite fast and deterministic.
+    """
+
+    # ------------------------------------------------------------------
+    # _decode_adrp_target
+    # ------------------------------------------------------------------
+
+    def test_decode_adrp_target_returns_none_for_non_adrp(self) -> None:
+        """A non-ADRP instruction (e.g. NOP = 0xD503201F) must return None."""
+        nop = 0xD503201F
+        result = BinaryAnalyzer._decode_adrp_target(nop, pc=0x1000)
+        assert result is None
+
+    def test_decode_adrp_target_positive_forward_page(self) -> None:
+        """ADRP pointing one page ahead of PC must return PC_page + 4096."""
+        pc = 0x10000
+        target_page = 0x11000   # one page forward
+        instr = _encode_adrp(rd=0, pc=pc, target_page=target_page)
+        result = BinaryAnalyzer._decode_adrp_target(instr, pc=pc)
+        assert result == target_page, (
+            f"Expected 0x{target_page:x}, got 0x{result:x} for instr=0x{instr:08x}"
+        )
+
+    def test_decode_adrp_target_same_page(self) -> None:
+        """ADRP with imm=0 must return the aligned PC page itself."""
+        pc = 0x1234      # mid-page address
+        expected_page = pc & ~0xFFF   # = 0x1000
+        instr = _encode_adrp(rd=0, pc=pc, target_page=expected_page)
+        result = BinaryAnalyzer._decode_adrp_target(instr, pc=pc)
+        assert result == expected_page
+
+    def test_decode_adrp_target_large_forward_offset(self) -> None:
+        """ADRP with a large positive page offset must decode correctly."""
+        pc = 0x400000
+        target_page = 0x900000   # 5 MiB ahead
+        instr = _encode_adrp(rd=5, pc=pc, target_page=target_page)
+        result = BinaryAnalyzer._decode_adrp_target(instr, pc=pc)
+        assert result == target_page
+
+    # ------------------------------------------------------------------
+    # _decode_add_imm12
+    # ------------------------------------------------------------------
+
+    def test_decode_add_imm12_valid_zero_offset(self) -> None:
+        """ADD Xd, Xn, #0 must return 0."""
+        instr = _encode_add_imm12(rd=0, rn=0, imm12=0)
+        assert BinaryAnalyzer._decode_add_imm12(instr) == 0
+
+    def test_decode_add_imm12_valid_nonzero(self) -> None:
+        """ADD Xd, Xn, #0xABC must return 0xABC."""
+        instr = _encode_add_imm12(rd=1, rn=0, imm12=0xABC)
+        assert BinaryAnalyzer._decode_add_imm12(instr) == 0xABC
+
+    def test_decode_add_imm12_max_offset(self) -> None:
+        """ADD Xd, Xn, #0xFFF (max imm12) must return 0xFFF."""
+        instr = _encode_add_imm12(rd=0, rn=1, imm12=0xFFF)
+        assert BinaryAnalyzer._decode_add_imm12(instr) == 0xFFF
+
+    def test_decode_add_imm12_non_add_returns_none(self) -> None:
+        """A SUB instruction must not be decoded as ADD."""
+        sub_instr = 0xD1000000   # SUB opcode
+        assert BinaryAnalyzer._decode_add_imm12(sub_instr) is None
+
+    def test_decode_add_imm12_nop_returns_none(self) -> None:
+        """NOP (0xD503201F) must not match the ADD mask."""
+        assert BinaryAnalyzer._decode_add_imm12(0xD503201F) is None
+
+    # ------------------------------------------------------------------
+    # _find_string_va
+    # ------------------------------------------------------------------
+
+    def test_find_string_va_found_in_rodata(self) -> None:
+        """Needle present in .rodata must be found and its VA returned."""
+        needle = b"ssl_client"
+        payload = b"\x00" * 16 + needle + b"\x00" * 8
+        rodata_va = 0x500000
+        binary = MagicMock()
+        sec = _make_mock_section(".rodata", va=rodata_va, content=payload)
+        binary.get_section.side_effect = lambda name: sec if name == ".rodata" else None
+
+        result = BinaryAnalyzer._find_string_va(binary, needle)
+        assert result == rodata_va + 16
+
+    def test_find_string_va_not_present_returns_none(self) -> None:
+        """Needle absent from all sections must return None."""
+        binary = MagicMock()
+        binary.get_section.return_value = None
+        result = BinaryAnalyzer._find_string_va(binary, b"ssl_client")
+        assert result is None
+
+    def test_find_string_va_prefers_rodata_over_data(self) -> None:
+        """When needle is in both .rodata and .data, .rodata VA wins."""
+        needle = b"ssl_client"
+        rodata_va = 0x100000
+        data_va = 0x200000
+        rodata_sec = _make_mock_section(".rodata", va=rodata_va, content=needle)
+        data_sec = _make_mock_section(".data", va=data_va, content=needle)
+
+        def side_effect(name: str):
+            return {"rodata": rodata_sec, ".data": data_sec, ".data.rel.ro": None}.get(
+                name, None
+            )
+
+        binary = MagicMock()
+        binary.get_section.side_effect = (
+            lambda n: rodata_sec if n == ".rodata" else None
+        )
+        result = BinaryAnalyzer._find_string_va(binary, needle)
+        assert result == rodata_va
+
+    # ------------------------------------------------------------------
+    # _find_function_start
+    # ------------------------------------------------------------------
+
+    def test_find_function_start_finds_prologue_directly_before_xref(self) -> None:
+        """STP prologue placed immediately before the XREF site must be found."""
+        text_va = 0x400000
+        prologue_word = _stp_x29_x30_word(16)   # STP X29, X30, [SP, #-16]!
+        nop = struct.pack("<I", 0xD503201F)
+        prologue_bytes = struct.pack("<I", prologue_word)
+        # Layout: [prologue][nop][nop][nop][XREF_here]
+        content = prologue_bytes + nop * 3 + nop
+        xref_va = text_va + len(prologue_bytes) + len(nop) * 3   # points at 4th NOP
+
+        binary = MagicMock()
+        text_sec = _make_mock_section(".text", va=text_va, content=content)
+        binary.get_section.return_value = text_sec
+
+        result = BinaryAnalyzer._find_function_start(binary, xref_va)
+        assert result == text_va
+
+    def test_find_function_start_returns_none_when_no_prologue(self) -> None:
+        """When only NOPs fill the scan window, None must be returned."""
+        text_va = 0x400000
+        nop = struct.pack("<I", 0xD503201F)
+        content = nop * 512   # 2 048 bytes, no prologue
+        xref_va = text_va + 2000
+
+        binary = MagicMock()
+        binary.get_section.return_value = _make_mock_section(
+            ".text", va=text_va, content=content
+        )
+
+        result = BinaryAnalyzer._find_function_start(binary, xref_va)
+        assert result is None
+
+    def test_find_function_start_returns_none_for_missing_text(self) -> None:
+        """Missing .text section must return None without raising."""
+        binary = MagicMock()
+        binary.get_section.return_value = None
+        result = BinaryAnalyzer._find_function_start(binary, xref_va=0x1000)
+        assert result is None
+
+    # ------------------------------------------------------------------
+    # _find_adrp_add_xrefs
+    # ------------------------------------------------------------------
+
+    def test_find_adrp_add_xrefs_detects_single_pair(self) -> None:
+        """A single ADRP+ADD pair referencing the string VA must yield one XREF."""
+        text_va = 0x100000
+        string_va = 0x500020   # page=0x500000, off12=0x20
+        pc_of_adrp = text_va + 8   # 3rd instruction slot
+
+        adrp_instr = _encode_adrp(rd=0, pc=pc_of_adrp, target_page=0x500000)
+        add_instr = _encode_add_imm12(rd=0, rn=0, imm12=0x20)
+        nop = 0xD503201F
+
+        content = b""
+        content += struct.pack("<II", nop, nop)     # two NOPs before
+        content += struct.pack("<II", adrp_instr, add_instr)
+        content += struct.pack("<II", nop, nop)     # two NOPs after
+
+        binary = MagicMock()
+        binary.get_section.return_value = _make_mock_section(
+            ".text", va=text_va, content=content
+        )
+
+        analyzer = BinaryAnalyzer()
+        xrefs = analyzer._find_adrp_add_xrefs(binary, string_va=string_va)
+        assert xrefs == [pc_of_adrp], f"Expected [{hex(pc_of_adrp)}], got {[hex(x) for x in xrefs]}"
+
+    def test_find_adrp_add_xrefs_no_match_returns_empty(self) -> None:
+        """All-NOP .text must yield no XREF sites."""
+        nop = 0xD503201F
+        content = struct.pack("<" + "I" * 16, *([nop] * 16))
+        binary = MagicMock()
+        binary.get_section.return_value = _make_mock_section(
+            ".text", va=0x400000, content=content
+        )
+        analyzer = BinaryAnalyzer()
+        assert analyzer._find_adrp_add_xrefs(binary, string_va=0x99000042) == []
+
+    def test_find_adrp_add_xrefs_wrong_add_offset_not_matched(self) -> None:
+        """ADRP+ADD pair where ADD imm12 doesn't match the string offset is skipped."""
+        text_va = 0x100000
+        string_va = 0x500020   # page=0x500000, off12=0x20
+        pc_of_adrp = text_va
+
+        adrp_instr = _encode_adrp(rd=0, pc=pc_of_adrp, target_page=0x500000)
+        wrong_add = _encode_add_imm12(rd=0, rn=0, imm12=0x40)   # off12=0x40 != 0x20
+
+        content = struct.pack("<II", adrp_instr, wrong_add)
+        binary = MagicMock()
+        binary.get_section.return_value = _make_mock_section(
+            ".text", va=text_va, content=content
+        )
+        analyzer = BinaryAnalyzer()
+        assert analyzer._find_adrp_add_xrefs(binary, string_va=string_va) == []
+
+    # ------------------------------------------------------------------
+    # find_offset_via_xref (public method)
+    # ------------------------------------------------------------------
+
+    def test_find_offset_via_xref_raises_file_not_found(self, tmp_path: Path) -> None:
+        """find_offset_via_xref must raise FileNotFoundError for missing lib."""
+        missing = tmp_path / "no_such.so"
+        with pytest.raises(FileNotFoundError):
+            BinaryAnalyzer().find_offset_via_xref(missing, arch="arm64-v8a")
+
+    def test_find_offset_via_xref_returns_empty_for_non_arm64(self, tmp_path: Path) -> None:
+        """For non-arm64 arch the XREF scan must return [] immediately."""
+        lib = tmp_path / "arm64-v8a" / "libflutter.so"
+        lib.parent.mkdir()
+        lib.write_bytes(b"ELF" + b"\x00" * 64)
+        # Patch _parse_binary to avoid real LIEF parse.
+        with patch.object(BinaryAnalyzer, "_parse_binary", return_value=MagicMock()):
+            result = BinaryAnalyzer().find_offset_via_xref(lib, arch="x86_64")
+        assert result == []
+
+    def test_find_offset_via_xref_method_tag(self, tmp_path: Path) -> None:
+        """Offsets returned by xref scan must have method == 'xref'."""
+        # Build a synthetic binary mock where:
+        #   - .rodata contains 'ssl_client'
+        #   - .text contains ADRP+ADD pointing to it
+        #   - An STP X29,X30 prologue sits before the ADRP
+        string_va = 0x800020
+        text_va = 0x400000
+        pc_adrp = text_va + 8
+
+        adrp_instr = _encode_adrp(rd=0, pc=pc_adrp, target_page=0x800000)
+        add_instr = _encode_add_imm12(rd=0, rn=0, imm12=0x20)
+        prologue_word = _stp_x29_x30_word(16)
+        nop = 0xD503201F
+
+        text_bytes = struct.pack(
+            "<IIIII",
+            nop,            # offset 0
+            nop,            # offset 4
+            adrp_instr,    # offset 8  <-- XREF site
+            add_instr,     # offset 12
+            nop,           # offset 16
+        )
+        # Manually replace first instruction with the prologue.
+        text_bytes = struct.pack("<I", prologue_word) + text_bytes[4:]
+
+        rodata_bytes = b"\x00" * 32 + b"ssl_client" + b"\x00" * 8
+
+        text_sec = _make_mock_section(".text", va=text_va, content=text_bytes)
+        rodata_sec = _make_mock_section(".rodata", va=0x800000, content=rodata_bytes)
+
+        def get_section(name: str):
+            return {".text": text_sec, ".rodata": rodata_sec}.get(name)
+
+        mock_binary = MagicMock()
+        mock_binary.get_section.side_effect = get_section
+        # Make _va_to_file_offset return VA as-is (PT_LOAD at 0x0).
+        mock_binary.segments = []
+
+        lib = tmp_path / "arm64-v8a" / "libflutter.so"
+        lib.parent.mkdir()
+        lib.write_bytes(b"placeholder")
+
+        with patch.object(BinaryAnalyzer, "_parse_binary", return_value=mock_binary):
+            offsets = BinaryAnalyzer().find_offset_via_xref(lib, arch="arm64-v8a")
+
+        assert len(offsets) >= 1, "Expected at least one XREF offset."
+        for off in offsets:
+            assert off.method == "xref", f"Expected method='xref', got {off.method!r}"
+            assert off.bypass_return == 1, "XREF offsets should have bypass_return=1"
+            assert off.return_type == "int"
+
+    def test_xref_scan_deduplicates_same_function(self, tmp_path: Path) -> None:
+        """Two XREF sites inside the same function must yield only one SslOffset."""
+        # Place two ADRP+ADD pairs in the same function (between same prologue
+        # and a NOP epilogue).  Only one offset should be emitted.
+        text_va = 0x400000
+        prologue_word = _stp_x29_x30_word(32)
+        adrp1 = _encode_adrp(rd=0, pc=text_va + 4, target_page=0x800000)
+        adrp2 = _encode_adrp(rd=1, pc=text_va + 12, target_page=0x800000)
+        add_instr = _encode_add_imm12(rd=0, rn=0, imm12=0)
+        nop = 0xD503201F
+
+        text_bytes = struct.pack(
+            "<IIIIII",
+            prologue_word,   # offset 0  (function start)
+            adrp1,          # offset 4  (XREF site 1)
+            add_instr,      # offset 8
+            adrp2,          # offset 12 (XREF site 2)
+            add_instr,      # offset 16
+            nop,            # offset 20
+        )
+        string_va = 0x800000   # page=0x800000, off12=0
+        rodata_bytes = b"ssl_client" + b"\x00" * 16
+
+        text_sec = _make_mock_section(".text", va=text_va, content=text_bytes)
+        rodata_sec = _make_mock_section(".rodata", va=0x800000, content=rodata_bytes)
+
+        mock_binary = MagicMock()
+        mock_binary.get_section.side_effect = (
+            lambda n: text_sec if n == ".text" else (
+                rodata_sec if n == ".rodata" else None
+            )
+        )
+        mock_binary.segments = []
+
+        lib = tmp_path / "arm64-v8a" / "libflutter.so"
+        lib.parent.mkdir()
+        lib.write_bytes(b"placeholder")
+
+        with patch.object(BinaryAnalyzer, "_parse_binary", return_value=mock_binary):
+            offsets = BinaryAnalyzer().find_offset_via_xref(lib, arch="arm64-v8a")
+
+        # Both xref sites belong to the same function — deduplicated to one entry.
+        assert len(offsets) == 1, (
+            f"Expected 1 deduplicated offset, got {len(offsets)}"
+        )

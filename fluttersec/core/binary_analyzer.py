@@ -30,7 +30,7 @@ result) when all three strategies come up empty.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import lief  # type: ignore[import-untyped]
@@ -56,6 +56,52 @@ _SSL_SYMBOLS: tuple[str, ...] = (
     "ssl_verify_cert_chain",
     "tls1_handshake_digest",
 )
+
+# Per-symbol bypass metadata used by both the symbol scanner and the Frida template.
+# bypass_return : value the NativeCallback will return (0 = ssl_verify_ok / false,
+#                 1 = ssl_verify_ok / true, depending on BoringSSL convention).
+# return_type   : Frida NativeCallback return type string.
+# arg_types     : Frida NativeCallback argument type list.
+_SSL_SYMBOL_METADATA: dict[str, dict] = {
+    # ssl_verify_peer_cert(SSL*, uint8_t*) -> enum ssl_verify_result_t
+    # ssl_verify_ok == 0 in BoringSSL.
+    "ssl_verify_peer_cert": {
+        "bypass_return": 0,
+        "return_type": "int",
+        "arg_types": ["pointer", "pointer"],
+    },
+    # ssl_crypto_x509_session_verify_cert_chain(SSL*, int) -> bool (1 = verified OK)
+    "ssl_crypto_x509_session_verify_cert_chain": {
+        "bypass_return": 1,
+        "return_type": "int",
+        "arg_types": ["pointer", "int"],
+    },
+    # ssl_verify_cert_chain(SSL*, STACK_OF_X509*) -> bool (1 = OK)
+    "ssl_verify_cert_chain": {
+        "bypass_return": 1,
+        "return_type": "int",
+        "arg_types": ["pointer", "pointer"],
+    },
+    # SSL_CTX_set_custom_verify(SSL_CTX*, int, callback*) -> void
+    # Making this a no-op prevents a custom verifier from being installed.
+    "SSL_CTX_set_custom_verify": {
+        "bypass_return": 0,
+        "return_type": "void",
+        "arg_types": ["pointer", "int", "pointer"],
+    },
+    # SSL_CTX_set_verify -- void, suppress any verify mode change.
+    "SSL_CTX_set_verify": {
+        "bypass_return": 0,
+        "return_type": "void",
+        "arg_types": ["pointer", "int", "pointer"],
+    },
+    # Fallback defaults for any other matched symbol.
+    "_default": {
+        "bypass_return": 0,
+        "return_type": "int",
+        "arg_types": ["pointer", "pointer"],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -120,9 +166,17 @@ class SslOffset:
         symbol: Name or description of the target function.
         virtual_address: ELF virtual address of the function entry point.
         file_offset: Raw byte offset from the start of the file.
-        method: Detection method — ``"symbol"``, ``"pattern"``, or
-            ``"version_map"``.
+        method: Detection method — ``"symbol"``, ``"xref"``,
+            ``"pattern"``, or ``"version_map"``.
         arch: ABI/architecture of the binary (e.g. ``"arm64-v8a"``).
+        bypass_return: Integer value the Frida NativeCallback should return
+            to signal «verification OK» for this specific function
+            (``0`` = ``ssl_verify_ok`` for ``ssl_verify_peer_cert``;
+             ``1`` = ``true`` / success for ``ssl_crypto_x509_…`` etc.).
+        return_type: Frida ``NativeCallback`` return-type string
+            (e.g. ``"int"`` or ``"void"``).
+        arg_types: Frida ``NativeCallback`` argument type list
+            (e.g. ``["pointer", "pointer"]``).
     """
 
     symbol: str
@@ -130,6 +184,9 @@ class SslOffset:
     file_offset: int
     method: str
     arch: str
+    bypass_return: int = 0
+    return_type: str = "int"
+    arg_types: list[str] = field(default_factory=lambda: ["pointer", "pointer"])
 
 
 @dataclass
@@ -239,7 +296,7 @@ class BinaryAnalyzer:
         strategies_used: list[str] = list({o.method for o in offsets})
 
         if raise_on_empty and not offsets:
-            tried = ["symbol", "pattern", "version_map"]
+            tried = ["symbol", "xref", "pattern", "version_map"]
             raise OffsetNotFoundError(effective_path, effective_ev, tried)
 
         return AnalysisResult(
@@ -254,10 +311,22 @@ class BinaryAnalyzer:
         engine_version: EngineVersion,
         arch: str | None = None,
     ) -> list[SslOffset]:
-        """Locate SSL pinning offsets using all three strategies.
+        """Locate SSL pinning offsets using a four-strategy cascade.
 
-        This is the primary workhorse method.  All strategies run and their
-        results are de-duplicated by virtual address and sorted ascending.
+        Strategies run in order and results are de-duplicated by virtual address
+        and merged into a single sorted list:
+
+        1. **Symbol scan** — ELF symbol table lookup (only works on unstripped
+           builds).
+        2. **String XREF scan** — Locates the ``"ssl_client"`` string literal
+           in ``.rodata`` and traces ARM64 ADRP+ADD instruction pairs in
+           ``.text`` back to the function entry point.  Architecture-resilient
+           because it uses the *meaning* of the code, not its byte encoding.
+        3. **Pattern scan** — Byte-sequence sliding-window scan with wildcard
+           support.  Filtered by arch and engine version prefix.
+        4. **Version-map lookup** — Pre-computed offsets from
+           ``data/version_map.yaml``, keyed by engine hash / Build-ID.  Only
+           runs when strategies 1-3 all return nothing.
 
         Args:
             lib_path: Path to ``libflutter.so``.
@@ -293,17 +362,27 @@ class BinaryAnalyzer:
                 results.append(offset)
                 seen_vas.add(offset.virtual_address)
 
-        # ── Strategy 2: Pattern scan ───────────────────────────────────────
+        # ── Strategy 2: String XREF scan ──────────────────────────────────
+        # Resilient against byte-pattern obfuscation: finds the 'ssl_client'
+        # string literal in .rodata then traces ADRP+ADD XREFs in .text back
+        # to the parent function entry point.  arm64-v8a only.
+        strategies_tried.append("xref")
+        for offset in self._xref_scan(binary, arch):
+            if offset.virtual_address not in seen_vas:
+                results.append(offset)
+                seen_vas.add(offset.virtual_address)
+
+        # ── Strategy 3: Pattern scan ───────────────────────────────────────
         strategies_tried.append("pattern")
         for offset in self._pattern_scan(binary, arch, engine_version):
             if offset.virtual_address not in seen_vas:
                 results.append(offset)
                 seen_vas.add(offset.virtual_address)
 
-        # ── Strategy 3: Version-map offset lookup ──────────────────────────
+        # ── Strategy 4: Version-map offset lookup ──────────────────────────
         strategies_tried.append("version_map")
         if not results:
-            # Only run the fallback if the two scanning strategies found nothing.
+            # Only run the fallback if all scanning strategies found nothing.
             # This avoids inflating results with potentially stale static data.
             for offset in self._version_map_lookup(engine_version, arch):
                 if offset.virtual_address not in seen_vas:
@@ -348,6 +427,9 @@ class BinaryAnalyzer:
         """Search the ELF symbol table for known SSL function names.
 
         Compatible with LIEF ≥ 0.13 and ≥ 0.14 (unified ``.symbols`` API).
+        Each matched symbol is enriched with bypass metadata from
+        :data:`_SSL_SYMBOL_METADATA` so the Frida template can emit the
+        correct ``NativeCallback`` signature and return value.
 
         Args:
             binary: Parsed LIEF ELF binary.
@@ -376,6 +458,10 @@ class BinaryAnalyzer:
                     if va == 0:
                         continue
                     file_off = BinaryAnalyzer._va_to_file_offset(binary, va)
+                    # Resolve per-symbol Frida hook metadata, falling back to defaults.
+                    meta = _SSL_SYMBOL_METADATA.get(target) or _SSL_SYMBOL_METADATA.get(name)
+                    if meta is None:
+                        meta = _SSL_SYMBOL_METADATA["_default"]
                     offsets.append(
                         SslOffset(
                             symbol=name,
@@ -383,6 +469,9 @@ class BinaryAnalyzer:
                             file_offset=file_off,
                             method="symbol",
                             arch=arch,
+                            bypass_return=meta["bypass_return"],
+                            return_type=meta["return_type"],
+                            arg_types=list(meta["arg_types"]),
                         )
                     )
                     log.debug("Symbol match: %s @ VA=0x%x  file_off=0x%x", name, va, file_off)
@@ -391,8 +480,359 @@ class BinaryAnalyzer:
         return offsets
 
     # ------------------------------------------------------------------
-    # Strategy 2 — byte-pattern scan
+    # Strategy 2 — string XREF scan (ARM64 ADRP+ADD cross-reference)
     # ------------------------------------------------------------------
+
+    #: The needle string BoringSSL embeds in its TLS alert table.
+    #: Present in every Flutter Engine release regardless of obfuscation.
+    _XREF_NEEDLE: bytes = b"ssl_client"
+
+    #: ARM64 sections to search for the needle string (in priority order).
+    _XREF_SEARCH_SECTIONS: tuple[str, ...] = (".rodata", ".data.rel.ro", ".data")
+
+    #: Maximum bytes to walk backwards from an XREF site when hunting for
+    #: the function prologue.  1 024 instructions × 4 bytes = 4 096 bytes.
+    _XREF_MAX_PROLOGUE_SCAN: int = 4096
+
+    def find_offset_via_xref(
+        self,
+        lib_path: Path,
+        arch: str | None = None,
+    ) -> list[SslOffset]:
+        """Public entry-point for the string XREF detection strategy.
+
+        Parses *lib_path* with LIEF, locates the ``"ssl_client"`` byte string
+        in ``.rodata``, then traces every ARM64 ADRP+ADD instruction pair in
+        ``.text`` that references that string.  For each reference site the
+        method walks backwards to the nearest ``STP X29, X30, [SP, #-N]!``
+        prologue, which marks the function entry point.
+
+        This is the preferred strategy when byte-pattern matching fails due to
+        Flutter Engine obfuscation, because it relies on the *semantics* of the
+        code (string references) rather than the exact byte encoding.
+
+        .. note::
+            Only ``arm64-v8a`` binaries are supported by the static ADRP
+            decoder.  For other architectures the method returns ``[]`` without
+            error; the remaining strategies continue normally.
+
+        Args:
+            lib_path: Path to ``libflutter.so``.
+            arch: ABI string.  Inferred from the parent directory name if
+                ``None``.
+
+        Returns:
+            List of :class:`SslOffset` instances, one per discovered XREF
+            site.  May be empty if the needle string is absent, no ADRP+ADD
+            pair is found, or the function prologue cannot be located.
+
+        Raises:
+            BinaryParseError: If LIEF cannot parse *lib_path*.
+            FileNotFoundError: If *lib_path* does not exist.
+        """
+        if not lib_path.exists():
+            raise FileNotFoundError(f"Library not found: {lib_path}")
+        if arch is None:
+            arch = lib_path.parent.name
+        binary = self._parse_binary(lib_path)
+        return self._xref_scan(binary, arch)
+
+    def _xref_scan(
+        self,
+        binary: lief.ELF.Binary,
+        arch: str,
+    ) -> list[SslOffset]:
+        """Run the full string XREF pipeline on a pre-parsed binary.
+
+        Broken out from :meth:`find_offset_via_xref` so :meth:`find_ssl_offsets`
+        can call it without re-parsing the binary.
+
+        Args:
+            binary: Parsed LIEF ELF binary.
+            arch: ABI string used for filtering and result metadata.
+
+        Returns:
+            List of :class:`SslOffset` found via XREF analysis.  Returns ``[]``
+            immediately for any non-arm64-v8a architecture.
+        """
+        if arch != "arm64-v8a":
+            log.debug(
+                "XREF scan: skipped for arch=%s (only arm64-v8a is supported).", arch
+            )
+            return []
+
+        # Step 1: Locate the needle string in a read-only data section.
+        string_va = self._find_string_va(binary, self._XREF_NEEDLE)
+        if string_va is None:
+            log.debug(
+                "XREF scan: needle %r not found in any data section.",
+                self._XREF_NEEDLE.decode(),
+            )
+            return []
+        log.debug(
+            "XREF scan: needle %r found at VA=0x%x.",
+            self._XREF_NEEDLE.decode(),
+            string_va,
+        )
+
+        # Step 2: Find every ADRP+ADD instruction pair that loads string_va.
+        xref_vas = self._find_adrp_add_xrefs(binary, string_va)
+        if not xref_vas:
+            log.debug(
+                "XREF scan: no ADRP+ADD references to VA=0x%x found in .text.",
+                string_va,
+            )
+            return []
+        log.debug("XREF scan: found %d ADRP+ADD reference(s).", len(xref_vas))
+
+        # Step 3: Walk backwards from each XREF site to the function prologue.
+        offsets: list[SslOffset] = []
+        seen_prologues: set[int] = set()
+        for xref_va in xref_vas:
+            prologue_va = self._find_function_start(
+                binary, xref_va, self._XREF_MAX_PROLOGUE_SCAN
+            )
+            if prologue_va is None:
+                log.debug(
+                    "XREF scan: could not find prologue for xref at VA=0x%x.",
+                    xref_va,
+                )
+                continue
+            if prologue_va in seen_prologues:
+                continue  # Multiple xref sites in the same function — deduplicate.
+            seen_prologues.add(prologue_va)
+
+            file_off = self._va_to_file_offset(binary, prologue_va)
+            offsets.append(
+                SslOffset(
+                    symbol="ssl_crypto_x509_session_verify_cert_chain [xref:ssl_client]",
+                    virtual_address=prologue_va,
+                    file_offset=file_off,
+                    method="xref",
+                    arch=arch,
+                    bypass_return=1,       # bool: chain verified OK
+                    return_type="int",
+                    arg_types=["pointer", "int"],
+                )
+            )
+            log.info(
+                "XREF hit: ssl_crypto_x509_session_verify_cert_chain  "
+                "VA=0x%x  file_off=0x%x  (xref_site=0x%x)",
+                prologue_va,
+                file_off,
+                xref_va,
+            )
+
+        return offsets
+
+    # -- ARM64 instruction decoders ----------------------------------------
+
+    @staticmethod
+    def _find_string_va(binary: lief.ELF.Binary, needle: bytes) -> int | None:
+        """Scan read-only data sections for *needle* and return its VA.
+
+        Checks ``.rodata``, ``.data.rel.ro``, and ``.data`` in that order.
+        Returns the VA of the *first* occurrence, or ``None`` if absent.
+
+        Args:
+            binary: Parsed LIEF ELF binary.
+            needle: Byte string to search for (e.g. ``b"ssl_client"``).
+
+        Returns:
+            ELF virtual address of the start of *needle*, or ``None``.
+        """
+        for section_name in BinaryAnalyzer._XREF_SEARCH_SECTIONS:
+            section = binary.get_section(section_name)
+            if section is None:
+                continue
+            content = bytes(section.content)
+            idx = content.find(needle)
+            if idx != -1:
+                va = section.virtual_address + idx
+                log.debug(
+                    "_find_string_va: %r found in %s at idx=%d  VA=0x%x",
+                    needle.decode(errors="replace"),
+                    section_name,
+                    idx,
+                    va,
+                )
+                return va
+        return None
+
+    @staticmethod
+    def _decode_adrp_target(instr: int, pc: int) -> int | None:
+        """Decode an ARM64 ADRP instruction and return the target *page* VA.
+
+        ADRP (Address of Page) loads the base address of a 4 KB page into a
+        register using a PC-relative, page-aligned immediate::
+
+            target_page = ALIGN_DOWN(PC, 4096) + sign_extend(imm21) << 12
+
+        Encoding layout (ARMv8-A reference, C6.2.10)::
+
+            [31]    = 1          (marks ADRP vs ADR)
+            [30:29] = immlo      (low 2 bits of the 21-bit immediate)
+            [28:24] = 10000      (ADRP opcode)
+            [23:5]  = immhi      (high 19 bits)
+            [4:0]   = Rd
+
+        Args:
+            instr: 32-bit instruction word (little-endian).
+            pc: Virtual address of this instruction.
+
+        Returns:
+            Target page VA, or ``None`` if *instr* is not an ADRP instruction.
+        """
+        if (instr & 0x9F000000) != 0x90000000:
+            return None
+        immlo: int = (instr >> 29) & 0x3
+        immhi: int = (instr >> 5) & 0x7FFFF
+        raw_imm: int = (immhi << 2) | immlo          # 21-bit concatenation
+        scaled: int = raw_imm << 12                  # scaled to page boundary
+        # Sign-extend from 33 bits (21 + 12 shift).
+        if scaled & (1 << 32):
+            scaled -= 1 << 33
+        return (pc & ~0xFFF) + scaled
+
+    @staticmethod
+    def _decode_add_imm12(instr: int) -> int | None:
+        """Decode an ARM64 ``ADD Xd, Xn, #imm12`` instruction and return imm12.
+
+        This handles the 64-bit register variant with shift=0.  The ADRP+ADD
+        pair is the standard compiler idiom for loading a page-relative
+        address into a register on AArch64.
+
+        Encoding layout (ARMv8-A reference, C6.2.4)::
+
+            [31:23] = 100100010  (ADD 64-bit, shift=0)
+            [21:10] = imm12
+            [9:5]   = Rn
+            [4:0]   = Rd
+
+        Args:
+            instr: 32-bit instruction word.
+
+        Returns:
+            The unsigned 12-bit immediate, or ``None`` if *instr* is not a
+            matching ``ADD`` instruction.
+        """
+        # Mask out imm12, Rn, Rd — only check the fixed opcode bits.
+        # 0xFF800000 covers [31:23]; expected = 0x91000000 (shift=0, 64-bit).
+        if (instr & 0xFF800000) != 0x91000000:
+            return None
+        return (instr >> 10) & 0xFFF
+
+    def _find_adrp_add_xrefs(
+        self,
+        binary: lief.ELF.Binary,
+        string_va: int,
+    ) -> list[int]:
+        """Enumerate ``.text`` instruction addresses that load *string_va* via ADRP+ADD.
+
+        Iterates over the ``.text`` section four bytes at a time (ARM64 uses
+        fixed-width 32-bit instructions).  For each ADRP whose target page
+        equals ``string_va & ~0xFFF``, the immediately following ADD is checked
+        for the matching low-12-bit offset.  A confirmed pair is recorded as an
+        XREF site.
+
+        Args:
+            binary: Parsed LIEF ELF binary.
+            string_va: Virtual address of the target string (from
+                :meth:`_find_string_va`).
+
+        Returns:
+            List of VAs (one per XREF site, pointing at the ADRP instruction).
+        """
+        text = binary.get_section(".text")
+        if text is None:
+            log.debug("_find_adrp_add_xrefs: no .text section.")
+            return []
+
+        content: bytes = bytes(text.content)
+        text_va: int = text.virtual_address
+        target_page: int = string_va & ~0xFFF
+        target_off12: int = string_va & 0xFFF
+
+        xrefs: list[int] = []
+        # Each ARM64 instruction is 4 bytes; stop 4 bytes early to safely
+        # peek at the following ADD instruction.
+        for i in range(0, len(content) - 7, 4):
+            instr1 = int.from_bytes(content[i : i + 4], "little")
+            pc = text_va + i
+            adrp_page = self._decode_adrp_target(instr1, pc)
+            if adrp_page != target_page:
+                continue
+            instr2 = int.from_bytes(content[i + 4 : i + 8], "little")
+            add_off = self._decode_add_imm12(instr2)
+            if add_off == target_off12:
+                xrefs.append(pc)
+                log.debug(
+                    "_find_adrp_add_xrefs: XREF at VA=0x%x  "
+                    "(ADRP page=0x%x  ADD off=0x%x)",
+                    pc,
+                    adrp_page,
+                    add_off,
+                )
+        return xrefs
+
+    @staticmethod
+    def _find_function_start(
+        binary: lief.ELF.Binary,
+        xref_va: int,
+        max_scan_bytes: int = 4096,
+    ) -> int | None:
+        """Walk backwards from *xref_va* to find the nearest ARM64 function prologue.
+
+        Looks for the ``STP X29, X30, [SP, #-N]!`` (pre-indexed store pair)
+        instruction that opens an ABI-compliant stack frame on AArch64::
+
+            Little-endian bytes:  FD  7B  ??  A9
+            32-bit mask:          0xFF00FFFF
+            Expected pattern:     0xA9007BFD
+
+        The ``??`` byte encodes the signed 7-bit ``imm7`` field (stack frame
+        size) which varies per function.  Any value is accepted.
+
+        Args:
+            binary: Parsed LIEF ELF binary.
+            xref_va: VA of the ADRP instruction that references the target
+                string.
+            max_scan_bytes: Maximum bytes to walk backwards before giving up
+                (default 4 096 = 1 024 ARM64 instructions).
+
+        Returns:
+            VA of the function entry-point instruction, or ``None`` if no
+            prologue is found within *max_scan_bytes*.
+        """
+        text = binary.get_section(".text")
+        if text is None:
+            return None
+
+        content: bytes = bytes(text.content)
+        text_va: int = text.virtual_address
+        start_idx: int = xref_va - text_va
+
+        if start_idx < 0 or start_idx >= len(content):
+            return None
+
+        # Walk backwards 4 bytes at a time.
+        low = max(0, start_idx - max_scan_bytes)
+        for i in range(start_idx, low - 1, -4):
+            word = int.from_bytes(content[i : i + 4], "little")
+            # STP X29, X30, [SP, #-N]!  — any frame size.
+            if (word & 0xFF00FFFF) == 0xA9007BFD:
+                return text_va + i
+        return None
+
+    # ------------------------------------------------------------------
+    # Strategy 3 — byte-pattern scan
+    # ------------------------------------------------------------------
+
+    # Minimum number of non-wildcard (concrete) bytes a pattern must contain
+    # before it is considered specific enough to scan.  Patterns below this
+    # threshold are far too generic and will produce hundreds of false positives
+    # across .text (e.g. a plain ARM64 function-prologue pattern).
+    _MIN_CONCRETE_BYTES: int = 6
 
     def _pattern_scan(
         self,
@@ -405,6 +845,16 @@ class BinaryAnalyzer:
         Patterns are filtered by architecture and (optionally) Flutter version
         prefix before scanning.  Each ``??`` token in the pattern string becomes
         a regex ``.`` that matches exactly one byte.
+
+        Each pattern entry in ``patterns.yaml`` may supply:
+
+        * ``max_matches`` (int, default ``1``) — stop after this many hits.
+          SSL functions appear exactly once; a generic prologue pattern that
+          matches hundreds of functions should still only contribute one
+          candidate (the first hit), not hundreds of false-positive patches.
+        * ``bypass_return`` (int, default ``0``) — value the Frida hook returns.
+        * ``return_type`` (str, default ``"int"``) — Frida NativeCallback type.
+        * ``arg_types`` (list[str], default ``["pointer","pointer"]``) — args.
 
         Args:
             binary: Parsed LIEF ELF binary.
@@ -449,29 +899,72 @@ class BinaryAnalyzer:
 
             symbol: str = pat_entry.get("symbol", "unknown_ssl_fn")
             pattern_hex: str = pat_entry.get("pattern", "")
+
+            # ── Concrete-byte guard ───────────────────────────────────────────
+            # Count the number of fixed (non-wildcard) bytes in the pattern.
+            # Patterns with too few concrete bytes are dangerously generic and
+            # will match common function prologues hundreds of times.
+            tokens = pattern_hex.strip().split()
+            concrete_count = sum(1 for t in tokens if t != "??")
+            if concrete_count < self._MIN_CONCRETE_BYTES:
+                log.warning(
+                    "Pattern '%s' has only %d concrete byte(s) — skipping "
+                    "(threshold: %d). Add more discriminating bytes to patterns.yaml.",
+                    symbol,
+                    concrete_count,
+                    self._MIN_CONCRETE_BYTES,
+                )
+                continue
+
             compiled = self._compile_pattern(pattern_hex)
             if compiled is None:
                 continue
 
+            # ── Per-pattern Frida hook metadata ──────────────────────────────
+            max_matches: int = int(pat_entry.get("max_matches", 1))
+            bypass_return: int = int(pat_entry.get("bypass_return", 0))
+            return_type: str = str(pat_entry.get("return_type", "int"))
+            raw_arg_types = pat_entry.get("arg_types", ["pointer", "pointer"])
+            arg_types: list[str] = list(raw_arg_types)
+
+            # ── Bounded match iteration ───────────────────────────────────────
+            match_count = 0
+            total_hits = 0
             for match in compiled.finditer(section_content):
-                rel_offset = match.start()
-                va = section_va + rel_offset
-                file_off = self._va_to_file_offset(binary, va)
-                offsets.append(
-                    SslOffset(
-                        symbol=symbol,
-                        virtual_address=va,
-                        file_offset=file_off,
-                        method="pattern",
-                        arch=arch,
+                total_hits += 1
+                if match_count < max_matches:
+                    rel_offset = match.start()
+                    va = section_va + rel_offset
+                    file_off = self._va_to_file_offset(binary, va)
+                    offsets.append(
+                        SslOffset(
+                            symbol=symbol,
+                            virtual_address=va,
+                            file_offset=file_off,
+                            method="pattern",
+                            arch=arch,
+                            bypass_return=bypass_return,
+                            return_type=return_type,
+                            arg_types=arg_types,
+                        )
                     )
-                )
-                log.debug(
-                    "Pattern match: %-50s  VA=0x%x  file_off=0x%x  (arch=%s)",
+                    log.debug(
+                        "Pattern match: %-50s  VA=0x%x  file_off=0x%x  (arch=%s)",
+                        symbol,
+                        va,
+                        file_off,
+                        arch,
+                    )
+                    match_count += 1
+
+            if total_hits > max_matches:
+                log.warning(
+                    "Pattern '%s' matched %d time(s) in .text but max_matches=%d; "
+                    "keeping first %d. Consider tightening the pattern in patterns.yaml.",
                     symbol,
-                    va,
-                    file_off,
-                    arch,
+                    total_hits,
+                    max_matches,
+                    max_matches,
                 )
 
         return offsets

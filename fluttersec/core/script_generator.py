@@ -40,6 +40,12 @@ class ScriptGenerator:
             lstrip_blocks=True,
             keep_trailing_newline=True,
         )
+        # Custom filter: converts a Python list of strings into a JavaScript
+        # array literal so arg_types can be rendered directly in the template.
+        # Example: ["pointer", "pointer"] → '["pointer", "pointer"]'
+        self._env.filters["js_array"] = lambda lst: (
+            "[" + ", ".join(f'"{item}"' for item in lst) + "]"
+        )
 
     def generate(
         self,
@@ -72,6 +78,11 @@ class ScriptGenerator:
             build_id=engine_version.build_id or "unknown",
             offsets=offsets,
             mode=mode,
+            # Enable the runtime Memory.scanSync XREF fallback when all four
+            # static strategies found nothing.  This lets the injected script
+            # locate ssl_crypto_x509_session_verify_cert_chain at runtime by
+            # tracing references to the "ssl_client" TLS alert string.
+            xref_runtime_fallback=len(offsets) == 0,
             generated_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         )
 

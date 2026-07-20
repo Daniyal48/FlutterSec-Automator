@@ -74,40 +74,40 @@ function hookFlutterSSL() {
   log("Flutter Engine version: {{ flutter_version }}");
 
 {% if offsets %}
-  // ── Hooking {{ offsets | length }} auto-detected SSL offset(s) ────────────
+  // ── Replacing {{ offsets | length }} auto-detected SSL function(s) ─────────
+  //
+  // Each hook uses Frida's Interceptor.replace() with a NativeCallback that
+  // immediately returns the value that signals "certificate verified OK" for
+  // that specific BoringSSL function.  The virtual address (VA) is added to
+  // the runtime base — NOT the raw file offset — because the dynamic linker
+  // maps the ELF LOAD segments starting at `base`, matching their in-file VA.
 {% for offset in offsets %}
   // ── [{{ loop.index }}/{{ offsets | length }}] {{ offset.symbol }} ─────────
-  //    Method : {{ offset.method }}
-  //    Arch   : {{ offset.arch }}
-  //    VA     : 0x{{ '%08x' | format(offset.virtual_address) }}
-  //    File + : 0x{{ '%08x' | format(offset.file_offset) }}
+  //    Method        : {{ offset.method }}
+  //    Arch          : {{ offset.arch }}
+  //    Virtual Addr  : 0x{{ '%08x' | format(offset.virtual_address) }}
+  //    bypass_return : {{ offset.bypass_return }}  ({{ offset.return_type }})
   (function () {
-    var targetAddr = base.add(0x{{ '%x' | format(offset.file_offset) }});
+    // base + virtual_address gives the correct runtime address.
+    // Using file_offset here would be WRONG: file offsets include ELF headers
+    // that are not present in the process memory map.
+    var targetAddr = base.add(0x{{ '%x' | format(offset.virtual_address) }});
     try {
-      // Wrap the target address as a NativeFunction so Frida knows its ABI.
-      // ssl_verify_result_t ssl_verify_peer_cert(SSL *ssl, uint8_t *out_alert)
-      var sslVerifyPeerCert = new NativeFunction(
+      Interceptor.replace(
         targetAddr,
-        'int',            // return type  — ssl_verify_result_t (0 = ok, 1 = invalid)
-        ['pointer', 'pointer']  // (ssl, out_alert)
+        new NativeCallback(
+          function () {
+{% if offset.return_type == "void" %}
+            // void function — no return value needed.
+{% else %}
+            return {{ offset.bypass_return }};
+{% endif %}
+          },
+          "{{ offset.return_type }}",
+          {{ offset.arg_types | js_array }}
+        )
       );
-
-      // Interceptor.replace completely substitutes the function body.
-      // This runs INSTEAD of the original — BoringSSL never sees a failure,
-      // so no handshake error is registered and the Dart engine stays stable.
-      Interceptor.replace(targetAddr, new NativeCallback(
-        function (ssl, out_alert) {
-          logSuccess(
-            "[{{ loop.index }}/{{ offsets | length }}] {{ offset.symbol }} intercepted "
-            + "— forcing retval=0x0 (ssl_verify_ok)"
-          );
-          return 0; // ssl_verify_ok — bypass complete
-        },
-        'int',            // return type matches NativeFunction above
-        ['pointer', 'pointer']  // (ssl, out_alert)
-      ));
-
-      logSuccess("Replaced [{{ loop.index }}]: {{ offset.symbol }} @ " + targetAddr);
+      logSuccess("Replaced {{ offset.symbol }} @ " + targetAddr + " (returns {{ offset.bypass_return }})");
     } catch (e) {
       logWarn("Failed to replace {{ offset.symbol }}: " + e.message);
     }
@@ -126,19 +126,130 @@ function hookFlutterSSL() {
   //
   // Manual analysis steps:
   //   - Open libflutter.so in Ghidra or IDA Pro.
-  //   - Search for "ssl_verify_peer_cert" or "SSL_CTX_set_custom_verify".
-  //   - Find the function prologue offset relative to the library base.
-  //   - Replace 0xDEADBEEF below with the actual file offset:
+  //   - Search for "ssl_client" in .rodata; follow XREFs to the caller.
+  //   - Scroll to the function start (STP X29, X30 prologue).
+  //   - Record the VA and supply it via: fluttersec analyze --offset <VA>
   //
   //   Interceptor.replace(base.add(0xDEADBEEF), new NativeCallback(
   //     function (ssl, out_alert) {
-  //       console.log("[FlutterSec ✔] ssl_verify_peer_cert intercepted - forcing retval=0x0");
+  //       console.log("[FlutterSec] ssl_verify_peer_cert intercepted");
   //       return 0; // ssl_verify_ok
   //     },
   //     'int', ['pointer', 'pointer']
   //   ));
   logWarn("No SSL offsets auto-detected for Flutter {{ flutter_version }}.");
   logWarn("Manual analysis required — see inline comments.");
+{% endif %}
+
+{% if xref_runtime_fallback %}
+  // ── Runtime XREF Fallback — Memory.scanSync for "ssl_client" ─────────────
+  //
+  // All static strategies (symbol, xref, pattern, version_map) found zero
+  // offsets.  This block searches for the "ssl_client" TLS alert string at
+  // runtime, decodes ADRP+ADD instruction pairs in libflutter.so to find
+  // callers, walks backwards to the STP X29,X30 function prologue, and hooks
+  // it — defeating obfuscation that renders static byte patterns useless.
+  //
+  // Architecture: arm64-v8a only (ADRP+ADD decoding is AArch64-specific).
+  (function xrefRuntimeFallback() {
+    log("XREF fallback: scanning for 'ssl_client' in libflutter.so...");
+
+    // 1. Locate the "ssl_client" bytes in module memory.
+    //    ascii: s=0x73 s=0x73 l=0x6c _=0x5f c=0x63 l=0x6c i=0x69 e=0x65 n=0x6e t=0x74
+    var strResults = Memory.scanSync(
+      libFlutter.base, libFlutter.size,
+      "73 73 6c 5f 63 6c 69 65 6e 74"
+    );
+    if (strResults.length === 0) {
+      logWarn("XREF fallback: 'ssl_client' not found in libflutter.so memory.");
+      return;
+    }
+    var stringAddr = strResults[0].address;
+    log("XREF fallback: 'ssl_client' at " + stringAddr);
+
+    // 2. Scan for ADRP+ADD pairs that load stringAddr.
+    //    ADRP: (instr & 0x9F000000) === 0x90000000
+    //      page = ALIGN_DOWN(PC, 4096) + sign_extend(immhi:immlo << 12)
+    //    ADD Xd, Xn, #imm12: (instr & 0xFF800000) === 0x91000000
+    //      imm12 = bits[21:10]
+    var stringPage = stringAddr.and(ptr(0xFFFFFFFFFFFFF000));
+    var stringOff12 = parseInt(stringAddr.and(ptr(0xFFF)).toString());
+
+    function decodeAdrpPage(instr, pc) {
+      if ((instr >>> 0 & 0x9F000000) !== 0x90000000) return null;
+      var immlo = (instr >>> 29) & 0x3;
+      var immhi = (instr >>> 5) & 0x7FFFF;
+      var raw = ((immhi << 2) | immlo);       // 21-bit immediate
+      var scaled = raw * 4096;               // left-shift 12 (avoid JS bit issues)
+      if (scaled >= 0x100000000) scaled -= 0x200000000;  // sign-extend 33-bit
+      var pcPage = pc.and(ptr(0xFFFFFFFFFFFFF000));
+      return scaled >= 0 ? pcPage.add(scaled) : pcPage.sub(-scaled);
+    }
+
+    function decodeAddImm12(instr) {
+      if ((instr >>> 0 & 0xFF800000) !== 0x91000000) return -1;
+      return (instr >>> 10) & 0xFFF;
+    }
+
+    var modBuf = Memory.readByteArray(libFlutter.base, libFlutter.size);
+    var view = new DataView(modBuf);
+    var scanLen = libFlutter.size - 7;
+    var xrefOffsets = [];
+
+    for (var i = 0; i < scanLen; i += 4) {
+      var instr1 = view.getUint32(i, true);
+      var pc = libFlutter.base.add(i);
+      var adrpPage = decodeAdrpPage(instr1, pc);
+      if (adrpPage === null || !adrpPage.equals(stringPage)) continue;
+      var instr2 = view.getUint32(i + 4, true);
+      if (decodeAddImm12(instr2) === stringOff12) {
+        xrefOffsets.push(i);
+      }
+    }
+
+    if (xrefOffsets.length === 0) {
+      logWarn("XREF fallback: no ADRP+ADD refs to 'ssl_client' found.");
+      return;
+    }
+    log("XREF fallback: " + xrefOffsets.length + " XREF site(s) found.");
+
+    // 3. Walk backwards from each XREF to STP X29,X30 prologue.
+    //    STP X29, X30, [SP, #-N]!  => mask 0xFF00FFFF, expected 0xA9007BFD
+    var MAX_WALK = 4096;
+    var hookedPrologues = [];
+
+    xrefOffsets.forEach(function (xrefOff) {
+      var lo = Math.max(0, xrefOff - MAX_WALK);
+      for (var j = xrefOff; j >= lo; j -= 4) {
+        var word = view.getUint32(j, true);
+        if ((word & 0xFF00FFFF) >>> 0 === 0xA9007BFD) {
+          var prologueAddr = libFlutter.base.add(j);
+          // Deduplicate across xref sites in the same function.
+          if (hookedPrologues.some(function (p) { return p.equals(prologueAddr); })) return;
+          hookedPrologues.push(prologueAddr);
+          // 4. Hook the discovered entry point.
+          try {
+            Interceptor.replace(
+              prologueAddr,
+              new NativeCallback(
+                function () { return 1; },  // bool true => chain verified OK
+                "int",
+                ["pointer", "int"]
+              )
+            );
+            logSuccess(
+              "XREF fallback: hooked ssl_crypto_x509_session_verify_cert_chain @ "
+              + prologueAddr
+            );
+          } catch (e) {
+            logWarn("XREF fallback: hook failed @ " + prologueAddr + ": " + e.message);
+          }
+          return;
+        }
+      }
+      logWarn("XREF fallback: no prologue near xref @ " + libFlutter.base.add(xrefOff));
+    });
+  })();
 {% endif %}
 
   // ── Java-layer SSL bypass (Android 7+ Network Security Config) ────────────

@@ -113,7 +113,12 @@ class TestScriptGenerator:
         assert "3.19.5" in content
 
     def test_generate_contains_offset_addresses(self, tmp_path: Path) -> None:
-        """Rendered script must include the hex file offsets for each hook."""
+        """Rendered script must include the hex virtual addresses for each hook.
+
+        The template must use ``offset.virtual_address`` (not ``file_offset``)
+        because the dynamic linker maps the ELF LOAD segments at the library
+        base using virtual addresses, not raw file byte offsets.
+        """
         gen = ScriptGenerator()
         path = gen.generate(
             offsets=_two_offsets(),
@@ -123,8 +128,10 @@ class TestScriptGenerator:
             output_dir=tmp_path,
         )
         content = path.read_text(encoding="utf-8")
-        # 0x0112AB80 → "112ab80" should appear in the Interceptor.replace line
-        assert "112ab80" in content.lower()
+        # 0x0512AB80 (virtual_address) → "512ab80" should appear in base.add(...)
+        # 0x0112AB80 (file_offset) must NOT be used — that would be the old bug.
+        assert "512ab80" in content.lower(), "Virtual address must appear in hook"
+        assert "112ab80" not in content.lower(), "File offset must NOT appear in hook"
 
     def test_generate_no_offsets_inserts_placeholder(self, tmp_path: Path) -> None:
         """Rendering with no offsets should include a manual-analysis placeholder comment."""
